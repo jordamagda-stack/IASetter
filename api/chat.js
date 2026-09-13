@@ -8,9 +8,9 @@ import { updateLeadFromAnalysis } from './engine/leadExtraction.js';
 import { getQualificationStatus } from './engine/qualification.js';
 import { calculateLeadScore, getLeadStatus } from './engine/scoring.js';
 import { decideNextAction } from './engine/decision.js';
-import { createBusinessConfig } from './engine/businessConfig.js';
+import { demoBusiness } from './config/demoBusiness.js';
 
-const DEFAULT_BUSINESS_CONFIG = createBusinessConfig({});
+const DEFAULT_BUSINESS_CONFIG = createBusinessConfig(demoBusiness);
 
 function cleanJsonResponse(text = '') {
   let cleaned = text.trim();
