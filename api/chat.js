@@ -221,10 +221,13 @@ IMPORTANTE:
     const parsed = safeParseJson(rawText);
 
     if (!parsed || !parsed.reply) {
-      return res.status(500).json({
-        error: 'Invalid AI response'
-      });
-    }
+  console.error('INVALID AI RESPONSE:', rawText);
+
+  return res.status(500).json({
+    error: 'Invalid AI response',
+    raw: rawText
+  });
+}
 
     // 3. Actualizamos la memoria del lead
     leadState = updateLeadFromAnalysis(
