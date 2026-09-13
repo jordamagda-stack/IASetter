@@ -1,4 +1,4 @@
-// api/engine/intent.js
+// engine/intent.js
 // Detecta la intención comercial principal del último mensaje del lead.
 
 export const INTENTS = {
