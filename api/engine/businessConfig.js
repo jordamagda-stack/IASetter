@@ -1,4 +1,4 @@
-// api/engine/businessConfig.js
+// engine/businessConfig.js
 // Configuración de un negocio.
 // El motor del Setter será independiente del negocio concreto.
 
