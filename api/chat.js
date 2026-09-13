@@ -1,72 +1,319 @@
 // api/chat.js
-// Esta función corre en el servidor de Vercel, nunca en el navegador.
-// Por eso la API key nunca queda expuesta al usuario final.
+// Orquestador principal del Setter IA.
+// El motor comercial está separado del negocio concreto.
 
-const SYSTEM_PROMPT = `Eres "Nora", el setter de IA de un programa premium de acompañamiento online (estilo infoproducto de coaching/transformación). Tu trabajo NO es responder preguntas como un FAQ — eres un setter: tu misión es cualificar al lead, generar confianza, manejar objeciones con calidez real, y llevarlo a agendar una llamada con el equipo humano de ventas cuando esté listo. Si detectas que el lead ya está muy caliente (menciona que quiere pagar ya, pide detalles de pago, dice "cómo empiezo"), díselo claramente: pásalo a un humano ahora mismo en vez de seguir la conversación tú.
+import { createLeadState, updateConversationState } from './engine/leadState.js';
+import { detectBasicIntent, INTENTS } from './engine/intent.js';
+import { updateLeadFromAnalysis } from './engine/leadExtraction.js';
+import { getQualificationStatus } from './engine/qualification.js';
+import { calculateLeadScore, getLeadStatus } from './engine/scoring.js';
+import { decideNextAction } from './engine/decision.js';
+import { createBusinessConfig } from './engine/businessConfig.js';
 
-Tono: cercano, natural, con humor cuando encaja, cero sonar a script. Frases cortas, como WhatsApp real. Máximo 1 emoji cada 2-3 mensajes, nunca en todos.
+const DEFAULT_BUSINESS_CONFIG = createBusinessConfig({});
 
-Información del programa (ejemplo, adaptable a cualquier infoproducto):
-- Programa de transformación de 12 semanas, 1:1 + comunidad.
-- Precio: 890€ pago único o 3 cuotas de 320€.
-- Garantía de 14 días.
-- Resultados visibles desde la semana 3-4 según el caso.
+function cleanJsonResponse(text = '') {
+  let cleaned = text.trim();
 
-Maneja estas objeciones con calidez, nunca a la defensiva:
-- Precio: reconoce la preocupación, reencuadra frente al coste de no actuar, menciona el pago en cuotas.
-- Tiempo: el programa cabe en 20-30 min/día, no es una segunda jornada.
-- Escepticismo: sé honesta, no prometas milagros, apóyate en la garantía de 14 días.
-- Duda / "lo tengo que pensar": normaliza la duda, ofrece la llamada gratuita como paso sin compromiso, sin presionar.
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/\s*```$/i, '');
+  }
 
-Cuando el lead esté listo (cualificado, objeciones resueltas, muestra intención clara), dile que le vas a pasar con el equipo para agendar su llamada de valoración gratuita — y termina tu mensaje con la etiqueta exacta [HANDOFF] en una línea aparte al final, para que el sistema lo detecte.
+  return cleaned.trim();
+}
 
-Respuestas siempre breves: 2-4 frases máximo, como conversación real de chat.`;
+function safeParseJson(text) {
+  try {
+    return JSON.parse(cleanJsonResponse(text));
+  } catch {
+    return null;
+  }
+}
+
+function determineStage(intent, qualificationStatus) {
+  if (intent === INTENTS.BUYING_SIGNAL ||
+      intent === INTENTS.READY_TO_BOOK) {
+    return 'CTA';
+  }
+
+  if (intent === INTENTS.OBJECTION) {
+    return 'DEEPEN';
+  }
+
+  if (qualificationStatus.progress >= 75) {
+    return 'QUALIFY';
+  }
+
+  if (qualificationStatus.progress >= 40) {
+    return 'DEEPEN';
+  }
+
+  return 'DISCOVERY';
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Método no permitido' });
-  }
-
-  const { messages } = req.body;
-
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: 'Formato de mensajes inválido' });
+    return res.status(405).json({
+      error: 'Method not allowed'
+    });
   }
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        system: SYSTEM_PROMPT,
-        messages: messages
-      })
-    });
+    const {
+      messages = [],
+      leadState: incomingLeadState = null,
+      businessConfig: incomingBusinessConfig = null
+    } = req.body || {};
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('Error de Anthropic:', data);
-      return res.status(response.status).json({ error: 'Error al contactar con el modelo' });
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({
+        error: 'messages is required'
+      });
     }
 
-    const reply = data.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n');
+    const apiKey = process.env.ANTHROPIC_API_KEY;
 
-    const handoff = reply.includes('[HANDOFF]');
-    const cleanReply = reply.replace('[HANDOFF]', '').trim();
+    if (!apiKey) {
+      return res.status(500).json({
+        error: 'ANTHROPIC_API_KEY is not configured'
+      });
+    }
 
-    return res.status(200).json({ reply: cleanReply, handoff });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Error interno del servidor' });
+    const businessConfig = createBusinessConfig(
+      incomingBusinessConfig || DEFAULT_BUSINESS_CONFIG
+    );
+
+    let leadState =
+      incomingLeadState || createLeadState();
+
+    const lastUserMessage =
+      [...messages]
+        .reverse()
+        .find((message) => message.role === 'user')
+        ?.content || '';
+
+    if (!lastUserMessage) {
+      return res.status(400).json({
+        error: 'No user message found'
+      });
+    }
+
+    // 1. Detectamos la intención básica
+    const intent = detectBasicIntent(lastUserMessage);
+
+    // 2. Construimos el contexto comercial para Claude
+    const systemPrompt = `
+Eres un Setter IA comercial.
+
+Tu función es mantener conversaciones naturales con potenciales clientes,
+entender su situación, detectar si existe encaje y ayudar a avanzar la
+conversación hacia el siguiente paso comercial adecuado.
+
+NO estás vinculado a un negocio concreto.
+Toda la información del negocio debe proceder de BUSINESS_CONFIG.
+
+No inventes:
+- precios
+- garantías
+- resultados
+- características de la oferta
+- condiciones de pago
+- enlaces
+- datos del negocio
+
+Si un dato no está disponible, no lo inventes.
+
+No finjas ser una persona humana.
+Si el usuario pregunta directamente si eres una IA, responde con transparencia.
+
+REGLAS DE CONVERSACIÓN:
+- Habla de forma natural y humana.
+- Evita respuestas largas.
+- Haz como máximo una pregunta principal por mensaje.
+- No repitas preguntas que ya hayan sido respondidas.
+- Utiliza la información que el lead ya proporcionó.
+- No presiones para comprar.
+- No ofrezcas una llamada si todavía no existe suficiente contexto.
+- Si existe una objeción, primero entiéndela antes de intentar avanzar.
+- Si el lead no encaja, no intentes forzar la venta.
+- Si está listo para reservar y existe un bookingUrl válido, puedes utilizarlo.
+- Si no existe bookingUrl, no inventes uno.
+
+TU DECISIÓN COMERCIAL YA HA SIDO CALCULADA POR EL MOTOR.
+No debes cambiarla.
+
+BUSINESS_CONFIG:
+${JSON.stringify(businessConfig, null, 2)}
+
+LEAD_STATE:
+${JSON.stringify(leadState, null, 2)}
+
+INTENCIÓN BÁSICA DETECTADA:
+${intent}
+
+Tu respuesta debe ser exclusivamente un JSON válido con esta estructura:
+
+{
+  "analysis": {
+    "name": null,
+    "email": null,
+    "phone": null,
+    "situation": null,
+    "problem": null,
+    "desiredOutcome": null,
+    "urgency": null,
+    "previousAttempts": null,
+    "payer": null,
+    "budgetFit": null,
+    "fit": null
+  },
+  "reply": "respuesta que verá el lead"
+}
+
+IMPORTANTE:
+- Usa null cuando no haya información nueva.
+- No borres información existente del lead.
+- "fit" debe ser true, false o null.
+- "budgetFit" debe ser true, false o null.
+- "urgency" debe ser "high", "medium", "low" o null.
+- La respuesta debe ser únicamente el mensaje que verá el lead.
+`;
+
+    const claudeResponse = await fetch(
+      'https://api.anthropic.com/v1/messages',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1200,
+          system: systemPrompt,
+          messages
+        })
+      }
+    );
+
+    if (!claudeResponse.ok) {
+      const errorText = await claudeResponse.text();
+
+      return res.status(500).json({
+        error: 'Claude API error',
+        details: errorText
+      });
+    }
+
+    const claudeData = await claudeResponse.json();
+
+    const rawText =
+      claudeData?.content
+        ?.filter((item) => item.type === 'text')
+        ?.map((item) => item.text)
+        ?.join('') || '';
+
+    const parsed = safeParseJson(rawText);
+
+    if (!parsed || !parsed.reply) {
+      return res.status(500).json({
+        error: 'Invalid AI response'
+      });
+    }
+
+    // 3. Actualizamos la memoria del lead
+    leadState = updateLeadFromAnalysis(
+      leadState,
+      parsed.analysis || {}
+    );
+
+    // 4. Actualizamos estado de conversación
+    const qualificationStatus =
+      getQualificationStatus(leadState);
+
+    const stage =
+      determineStage(
+        intent,
+        qualificationStatus
+      );
+
+    leadState = {
+      ...leadState,
+      conversation: {
+        ...leadState.conversation,
+        stage
+      }
+    };
+
+    // 5. Actualizamos flags
+    if (intent === INTENTS.OBJECTION) {
+      leadState.flags = {
+        ...leadState.flags,
+        objection: lastUserMessage
+      };
+    }
+
+    if (intent === INTENTS.NEGATIVE_SIGNAL) {
+      leadState.flags = {
+        ...leadState.flags,
+        noFit: true
+      };
+    }
+
+    if (leadState.qualification.fit === false) {
+      leadState.flags = {
+        ...leadState.flags,
+        noFit: true
+      };
+    }
+
+    // 6. Calculamos score
+    const score = calculateLeadScore(leadState);
+
+    // 7. Estado comercial
+    const leadStatus = getLeadStatus(score.total);
+
+    leadState = {
+      ...leadState,
+      status: leadStatus,
+      score,
+      conversation: {
+        ...leadState.conversation,
+        messagesCount:
+          leadState.conversation.messagesCount + 1,
+        lastUserMessage,
+        lastAgentMessage: parsed.reply
+      }
+    };
+
+    // 8. Decisión del motor
+    const decision = decideNextAction(leadState);
+
+    leadState = {
+      ...leadState,
+      nextAction: decision.action
+    };
+
+    // 9. Respuesta final
+    return res.status(200).json({
+      reply: parsed.reply,
+      handoff: decision.action === 'HANDOFF',
+      intent,
+      decision,
+      score,
+      qualification: getQualificationStatus(leadState),
+      leadState
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+      error: 'Internal server error'
+    });
   }
 }
