@@ -53,6 +53,10 @@ export function detectBasicIntent(message = '') {
     text.includes('muy caro') ||
     text.includes('no puedo') ||
     text.includes('no tengo dinero') ||
+    text.includes('no tengo presupuesto') ||
+    text.includes('poco presupuesto') ||
+    text.includes('mucho presupuesto') ||
+    text.includes('no me alcanza') ||
     text.includes('no tengo tiempo') ||
     text.includes('me lo tengo que pensar') ||
     text.includes('tengo que pensarlo') ||
